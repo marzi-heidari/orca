@@ -1,23 +1,56 @@
 import argparse
+import os
 import warnings
+from itertools import cycle
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from pykeops.torch import LazyTensor
+from sklearn import metrics
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import models
 import open_world_cifar as datasets
 import utils_u
-from diffusion_u import create_diffusion, ema, timestep_sampler
+from diffusion_u import create_diffusion, ema
 from diffusion_u.timestep_sampler import UniformSampler
 from models.transformer import Gpt
-from utils import cluster_acc, AverageMeter, entropy, MarginLoss, accuracy, TransformTwice
-from sklearn import metrics
-import numpy as np
-import os
-from torch.utils.tensorboard import SummaryWriter
-from itertools import cycle
+from utils import cluster_acc, AverageMeter, entropy, accuracy, TransformTwice
+
+@torch.no_grad()
+def KMeans(x, K=10, Niter=10, verbose=True):
+    """Implements Lloyd's algorithm for the Euclidean metric."""
+
+    N, D = x.shape  # Number of samples, dimension of the ambient space
+
+    c = x[:K, :].clone()  # Simplistic initialization for the centroids
+
+    x_i = LazyTensor(x.view(N, 1, D))  # (N, 1, D) samples
+    c_j = LazyTensor(c.view(1, K, D),)  # (1, K, D) centroids
+
+    # K-means loop:
+    # - x  is the (N, D) point cloud,
+    # - cl is the (N,) vector of class labels
+    # - c  is the (K, D) cloud of cluster centroids
+    for i in range(Niter):
+        # E step: assign poinqqqts to the closest cluster -------------------------
+        D_ij = ((x_i - c_j) ** 2).sum(-1)  # (N, K) symbolic squared distances
+        cl = D_ij.argmin(dim=1,backend="CPU").long().view(-1)  # Points -> Nearest cluster
+
+        # M step: update the centroids to the normalized cluster average: ------
+        # Compute the sum of points per cluster:
+        c.zero_()
+        c.scatter_add_(0, cl[:, None].repeat(1, D), x)
+
+        # Divide by the number of points per cluster:
+        Ncl = torch.bincount(cl, minlength=K).type_as(c).view(K, 1)
+        c /= Ncl  # in-place division to compute the average
+
+    return cl, c
 
 
 def train(args, model, device, train_label_loader, train_unlabel_loader, optimizer, epoch, tf_writer, diffusion,
@@ -36,18 +69,18 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
         x = torch.cat([x, ux], 0)
         x2 = torch.cat([x2, ux2], 0)
 
-        x, x2, target = x.to(device), x2.to(device), target.to(device)
-        ux, ux2 = ux.to(device), ux2.to(device)
+        x, x2, target = x.cuda(args.gpu), x2.cuda(args.gpu), target.cuda(args.gpu)
+        ux, ux2 = ux.cuda(args.gpu), ux2.cuda(args.gpu)
         optimizer.zero_grad()
         diffusion_optimizer.zero_grad()
         output, feat = model(x)
+        # output2, feat2 = model(x2)
         with torch.no_grad():
             logits_x_ulb_w, feat2 = model(ux2)
 
         labeled_len = len(target)
         # Compute context vectors for unlabeled data
 
-        pseudo_labels = F.softmax(logits_x_ulb_w, dim=1)
         y_c_u = compute_context_vector(feat[labeled_len:, ], logits_x_ulb_w, 5, 0.9)
         logits_x_lb = output[:labeled_len, :]
         y_c_l = compute_context_vector(feat[:labeled_len, :], logits_x_lb, 5, 0.9)
@@ -60,21 +93,26 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
 
         diffusion_loss_, denoised_labeld_ = diffusion.training_losses(diffusion_model,
                                                                       logits_x_lb, y_c_l, t)
-        p_sample = diffusion.p_sample(diffusion_model, logits_x_ulb_w, y_c_u,
-                                      torch.ones(logits_x_ulb_w.shape[0], dtype=torch.long).cuda(args.gpu))
-        p_sample_l = diffusion.p_sample(diffusion_model, logits_x_lb, y_c_l,
-                                        torch.ones(logits_x_lb.shape[0], dtype=torch.long).cuda(args.gpu))
-        # Compute total loss and backpropagate
-        clean_logits_u = p_sample["pred_xstart"]
-        labels_denoised_labeld = F.softmax(clean_logits_u, dim=1)
-        clean_logits_l = p_sample_l["pred_xstart"]
-        unsup_loss = compute_unsup_loss(labels_denoised_labeld, clean_logits_u, args.gpu, num_classes=args.no_class,
+        # p_sample = diffusion.p_sample(diffusion_model, logits_x_ulb_w, y_c_u,
+        #                               torch.ones(logits_x_ulb_w.shape[0], dtype=torch.long).cuda(args.gpu) * 5)
+        # p_sample_l = diffusion.p_sample(diffusion_model, logits_x_lb, y_c_l,
+        #                                 torch.ones(logits_x_lb.shape[0], dtype=torch.long).cuda(args.gpu) * 5)
+        # # Compute total loss and backpropagate
+        # clean_logits_u = p_sample["pred_xstart"]
+        # labels_denoised_labeld = F.softmax(clean_logits_u, dim=1)
+        # clean_logits_l = p_sample_l["pred_xstart"]
+
+        # cl, c = KMeans(feat2.detach().cpu(), K=args.no_class, Niter=10, verbose=True)
+        # unsup_loss=F.cross_entropy(output[labeled_len:,: ], cl.cuda(args.gpu))
+
+        unsup_loss = compute_unsup_loss(F.softmax(logits_x_ulb_w,dim=1),output[labeled_len:,: ] , args.gpu, num_classes=args.no_class,
                                         unseen_classes=[])
-        ce_loss = F.cross_entropy(clean_logits_l, target)
-        prob = F.softmax(torch.cat((clean_logits_l, clean_logits_u), dim=0), dim=1)
+        ce_loss = F.cross_entropy(output[:labeled_len,: ], target)
+        prob = F.softmax(output, dim=1)
         entropy_loss = entropy(torch.mean(prob, 0))
 
-        loss = - entropy_loss + ce_loss + diffusion_loss_.mean() + unsup_loss
+        # bce_loss = calculate_bce_loss(args, output2, labeled_len, prob, feat, target)
+        loss = - entropy_loss + ce_loss + diffusion_loss_.mean()
 
         # bce_losses.update(bce_loss.item(), args.batch_size)
         ce_losses.update(ce_loss.item(), args.batch_size)
@@ -136,9 +174,9 @@ def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, diffus
     confs = np.array([])
     with torch.no_grad():
         for batch_idx, (x, label) in enumerate(test_loader):
-            x, label = x.to(device), label.to(device)
+            x, label = x.cuda(args.gpu), label.cuda(args.gpu)
             output, _ = model(x)
-            t = torch.ones(output.shape[0], dtype=torch.long).cuda(args.gpu)
+            t = torch.ones(output.shape[0], dtype=torch.long).cuda(args.gpu) * 5
             t = t.cuda(args.gpu)
             denoised_labeld = diffusion.p_sample(diffusion_model,
                                                  output, F.softmax(output, dim=1), t)
@@ -163,7 +201,7 @@ def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, diffus
         best_acc = overall_acc
         best_unseen_acc = unseen_acc
         best_seen_acc = seen_acc
-    print('Test overall acc {:.4f}, seen acc {:.4f}, unseen acc {:.4f}'.format(overall_acc, seen_acc, unseen_acc))
+    print('\nTest overall acc {:.4f}, seen acc {:.4f}, unseen acc {:.4f}'.format(overall_acc, seen_acc, unseen_acc))
     print('Test unseen nmi {:.4f}, mean uncertainty {:.4f}'.format(unseen_nmi, mean_uncert))
     print('Best overall acc {:.4f}, seen acc {:.4f}, unseen acc {:.4f}\n'.format(best_acc, best_seen_acc,
                                                                                  best_unseen_acc))
@@ -189,8 +227,8 @@ def compute_unsup_loss(denoised_soft_labels, logits_x_ulb_s, gpu, num_classes=10
 
     # Balance the set
     unique_labels, counts = confident_labels.unique(return_counts=True)
-    if len(unique_labels) < num_classes:
-        return torch.tensor(0.0).cuda(gpu)
+    # if len(unique_labels) < num_classes:
+    #     return torch.tensor(0.0).cuda(gpu)
 
     min_samples = counts.min()
 
@@ -298,22 +336,22 @@ def main():
 
     # Initialize the splits
     train_label_loader = torch.utils.data.DataLoader(train_label_set, batch_size=labeled_batch_size, shuffle=True,
-                                                     num_workers=2, drop_last=True)
+                                                     num_workers=0, drop_last=True)
     train_unlabel_loader = torch.utils.data.DataLoader(train_unlabel_set,
                                                        batch_size=args.batch_size - labeled_batch_size, shuffle=True,
-                                                       num_workers=2, drop_last=True)
-    test_loader = torch.utils.data.DataLoader(test_set, batch_size=100, shuffle=False, num_workers=1)
+                                                       num_workers=0, drop_last=True)
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size=100, shuffle=False, num_workers=0)
 
     # First network intialization: pretrain the RotNet network
     model = models.resnet18(num_classes=num_classes)
-    model = model.to(device)
+    model = model.cuda(args.gpu)
 
     if args.dataset == 'cifar10':
         state_dict = torch.load('./pretrained/simclr_cifar_10.pth.tar')
     elif args.dataset == 'cifar100':
         state_dict = torch.load('./pretrained/simclr_cifar_100.pth.tar')
     model.load_state_dict(state_dict, strict=False)
-    model = model.to(device)
+    model = model.cuda(args.gpu)
 
     # Freeze the earlier filters
     for name, param in model.named_parameters():

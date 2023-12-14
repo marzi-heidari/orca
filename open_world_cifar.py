@@ -103,6 +103,7 @@ class OPENWORLDCIFAR10(torchvision.datasets.CIFAR10):
                 unlabeled_idxs.append(idx)
         return labeled_idxs, unlabeled_idxs
 
+
     def shrink_data(self, idxs):
         targets = np.array(self.targets)
         self.targets = targets[idxs].tolist()

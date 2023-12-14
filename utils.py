@@ -5,6 +5,8 @@ from scipy.optimize import linear_sum_assignment
 import os
 import os.path
 import torch.nn.functional as F
+from torch.utils.data import BatchSampler, DataLoader, Sampler
+
 
 class TransformTwice:
     def __init__(self, transform):
@@ -96,3 +98,34 @@ class MarginLoss(nn.Module):
     
         output = torch.where(index, x_m, x)
         return F.cross_entropy(output, target, weight=self.weight)
+
+
+class BalancedBatchSampler(Sampler):
+    def __init__(self, dataset, num_classes, batch_size):
+        self.dataset = dataset
+        self.num_classes = num_classes
+        self.batch_size = batch_size
+        self.class_indices = self._group_indices_by_class()
+        self.batches = self._create_batches()
+
+    def _group_indices_by_class(self):
+        class_indices = [[] for _ in range(self.num_classes)]
+        for idx, (_, label) in enumerate(self.dataset):
+            class_indices[label].append(idx)
+        return class_indices
+
+    def _create_batches(self):
+        batches = []
+        for _ in range(len(self.class_indices[0]) // (self.batch_size // self.num_classes)):
+            batch = []
+            for class_idx_list in self.class_indices:
+                batch.extend(np.random.choice(class_idx_list, self.batch_size // self.num_classes, replace=False))
+            np.random.shuffle(batch)
+            batches.extend(batch)
+        return batches
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def __len__(self):
+        return len(self.batches) // self.batch_size

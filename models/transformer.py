@@ -182,7 +182,7 @@ class FrequencyEmbedder(nn.Module):
         N = x.size(0)
         if x.dim() == 1:  # (N,)
             x = x.unsqueeze(1)  # (N, D) where D=1
-        x_unsqueezed = x.unsqueeze(-1).to('cuda', torch.float)  # (N, D, 1)
+        x_unsqueezed = x.unsqueeze(-1).to(torch.float)  # (N, D, 1)
         scaled = self.frequencies.view(1, 1, -1) * x_unsqueezed  # (N, D, num_frequencies)
         s = torch.sin(scaled)
         c = torch.cos(scaled)

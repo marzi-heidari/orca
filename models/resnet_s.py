@@ -138,3 +138,28 @@ class NormedLinear(nn.Module):
     def forward(self, x):
         out = F.normalize(x, dim=1).mm(F.normalize(self.weight, dim=0))
         return 10 * out
+
+
+class SimpleDiscriminator(nn.Module):
+    def __init__(self):
+        super(SimpleDiscriminator, self).__init__()
+
+        # Define the architecture
+        self.net = nn.Sequential(
+            # First linear layer
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+
+            # Second linear layer
+            nn.Linear(256, 128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+
+            # Output layer
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.net(x)

@@ -64,35 +64,39 @@ def calculate_gen_loss(discriminator, diffusion_model, prototypes, diffusion, gp
     return fake_loss
 
 
-def KMeans(x, K=10, Niter=10, verbose=True):
-    """Implements Lloyd's algorithm for the Euclidean metric."""
+def kmeans(X, num_clusters, num_iterations=10):
+    """
+    Performs K-Means clustering on PyTorch tensors.
 
-    N, D = x.shape  # Number of samples, dimension of the ambient space
+    Args:
+    X: PyTorch tensor of data points, shape (num_samples, num_features).
+    num_clusters: Number of clusters.
+    num_iterations: Number of iterations to run the algorithm.
 
-    c = x[:K, :].clone()  # Simplistic initialization for the centroids
+    Returns:
+    centroids: Final cluster centroids.
+    labels: Index of the cluster each sample belongs to.
+    """
+    with torch.no_grad():
+        # Step 1: Initialize centroids randomly
+        indices = torch.randperm(X.size(0))[:num_clusters]
+        centroids = X[indices]
 
-    x_i = LazyTensor(x.view(N, 1, D))  # (N, 1, D) samples
-    c_j = LazyTensor(c.view(1, K, D))  # (1, K, D) centroids
+        for _ in range(num_iterations):
+            # Step 2: Assign each point to the nearest centroid
+            distances = torch.cdist(X, centroids, p=2)  # L2 distance
+            labels = torch.argmin(distances, dim=1)
 
-    # K-means loop:
-    # - x  is the (N, D) point cloud,
-    # - cl is the (N,) vector of class labels
-    # - c  is the (K, D) cloud of cluster centroids
-    for i in range(Niter):
-        # E step: assign points to the closest cluster -------------------------
-        D_ij = ((x_i - c_j) ** 2).sum(-1)  # (N, K) symbolic squared distances
-        cl = D_ij.argmin(dim=1).long().view(-1)  # Points -> Nearest cluster
+            # Step 3: Update centroids
+            new_centroids = torch.stack([X[labels == k].mean(dim=0) for k in range(num_clusters)])
 
-        # M step: update the centroids to the normalized cluster average: ------
-        # Compute the sum of points per cluster:
-        c.zero_()
-        c.scatter_add_(0, cl[:, None].repeat(1, D), x)
+            # Check for convergence (if centroids do not change)
+            if torch.all(new_centroids == centroids):
+                break
 
-        # Divide by the number of points per cluster:
-        Ncl = torch.bincount(cl, minlength=K).type_as(c).view(K, 1)
-        c /= Ncl  # in-place division to compute the average
+            centroids = new_centroids
 
-    return cl, c
+    return centroids, labels
 
 
 def euclidean_dist(x, y):
@@ -132,6 +136,7 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
         diffusion_optimizer.zero_grad()
         optimizer_d.zero_grad()
         output, feat = model(x)
+        output2, feat_ = model(x2)
 
         logits_x_ulb_w, feat2 = model(ux2)
 
@@ -142,9 +147,11 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
         one_hot_labels = F.one_hot(target, args.no_class)
         p1 = compute_prototype(feat[:labeled_len, ], one_hot_labels, args.no_class // 2, gpu=args.gpu)
         logits_x_lb = output[:labeled_len, :]
-
-        p2 = compute_prototype(feat[labeled_len:, :], pseudo_labels, args.no_class, gpu=args.gpu)
-        proto = torch.cat((p1, p2[args.no_class // 2:, :]), dim=0)
+        if epoch == 0:
+            p2 = kmeans(feat[labeled_len:, :], args.no_class, )[0]
+        else:
+            p2 = compute_prototype(feat[labeled_len:, :], pseudo_labels, args.no_class, gpu=args.gpu)
+        proto = torch.cat((p1, p2[args.no_class // 2:, :].cuda(args.gpu)), dim=0)
         prototypes = update_prototype(prototypes, proto)
         t, vlb_weights = timestep_sampler.sample(labeled_len, args.gpu)
         t = t.cuda(args.gpu)
@@ -156,27 +163,27 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
                                                                       feat[:labeled_len, :].detach(),
                                                                       labeled_context.detach(), t)
 
-        discriminator_loss = calculate_dis_loss(discriminator, diffusion_model, prototypes[50:], feat[labeled_len:],
-                                                pseudo_labels,
-                                                diffusion, args.gpu)
+        # discriminator_loss = calculate_dis_loss(discriminator, diffusion_model, prototypes[50:], feat[labeled_len:],
+        #                                         pseudo_labels,
+        #                                         diffusion, args.gpu)
 
-        discriminator_loss1 = calculate_gen_loss(discriminator, diffusion_model, prototypes[50:],
-
-                                                 diffusion, args.gpu)
+        # discriminator_loss1 = calculate_gen_loss(discriminator, diffusion_model, prototypes[50:],
+        #
+        #                                          diffusion, args.gpu)
 
         logits_ub_s = output[labeled_len:, :]
         # unsup_loss = compute_unsup_loss(pseudo_labels, logits_ub_s, args.gpu, num_classes=args.no_class)
-
+        bce_loss = calculate_bce_loss(args, output2, labeled_len, F.softmax(output, dim=1), feat, target)
         query_to_proto_distance = euclidean_dist(feat[:labeled_len], prototypes[:50])
         # ce_loss = F.cross_entropy(logits_x_lb, target)
         ce_loss = F.cross_entropy(-query_to_proto_distance, target)
         distances = euclidean_dist(feat[labeled_len:], prototypes)
         distances2 = euclidean_dist(feat2, prototypes)
-        unsup_loss = F.mse_loss(-distances, -distances2)
-        prob = F.softmax(-distances, dim=1)
+        unsup_loss = F.mse_loss(F.softmax(-distances, dim=1), F.softmax(-distances2, dim=1))
+        prob = F.softmax(distances, dim=1)
         entropy_loss = entropy(torch.mean(prob, 0))
 
-        loss = - entropy_loss + ce_loss + diffusion_loss_.mean()+unsup_loss  - discriminator_loss1 + discriminator_loss
+        loss =  ce_loss + diffusion_loss_.mean() + 0.5 * unsup_loss+bce_loss
 
         # bce_losses.update(bce_loss.item(), args.batch_size)
         ce_losses.update(ce_loss.item(), args.batch_size)
@@ -465,7 +472,6 @@ def main():
 
     tf_writer = SummaryWriter(log_dir=args.savedir)
     prototypes = torch.zeros((args.no_class, 512)).cuda(args.gpu)
-    alpha = 0.9
 
     for epoch in tqdm(range(args.epochs)):
         mean_uncert = test(args, model, args.labeled_num, device, test_loader, epoch, tf_writer, diffusion,

@@ -2,7 +2,7 @@
 import torch
 
 
-def generalized_steps(model, x, time, numstep=10):
+def generalized_steps(model, x, time, numstep=10,device='cuda'):
     with torch.no_grad():
         num_steps = numstep
         skip = time // num_steps
@@ -15,7 +15,7 @@ def generalized_steps(model, x, time, numstep=10):
 
         for i, j in zip(reversed(seq), reversed(seq_next)):
             t = (torch.ones(n) * i).to(x.device)
-            xt = xs[-1].to('cuda')
+            xt = xs[-1].to(device)
 
             x0_t = model(xt, x, t)
             xs.append(x0_t[:, 0, :])

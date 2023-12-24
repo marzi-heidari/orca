@@ -16,10 +16,12 @@ from tqdm import tqdm
 import models
 import open_world_cifar as datasets
 import utils_u
-from diffusion_u import create_diffusion, ema
+from diffusion_u import create_diffusion, ema, timestep_sampler
 from diffusion_u.timestep_sampler import UniformSampler
 from models.transformer import Gpt
 from utils import cluster_acc, AverageMeter, entropy, accuracy, TransformTwice
+from utils_u import sampling
+
 
 @torch.no_grad()
 def KMeans(x, K=10, Niter=10, verbose=True):
@@ -30,7 +32,7 @@ def KMeans(x, K=10, Niter=10, verbose=True):
     c = x[:K, :].clone()  # Simplistic initialization for the centroids
 
     x_i = LazyTensor(x.view(N, 1, D))  # (N, 1, D) samples
-    c_j = LazyTensor(c.view(1, K, D),)  # (1, K, D) centroids
+    c_j = LazyTensor(c.view(1, K, D), )  # (1, K, D) centroids
 
     # K-means loop:
     # - x  is the (N, D) point cloud,
@@ -39,7 +41,7 @@ def KMeans(x, K=10, Niter=10, verbose=True):
     for i in range(Niter):
         # E step: assign poinqqqts to the closest cluster -------------------------
         D_ij = ((x_i - c_j) ** 2).sum(-1)  # (N, K) symbolic squared distances
-        cl = D_ij.argmin(dim=1,backend="CPU").long().view(-1)  # Points -> Nearest cluster
+        cl = D_ij.argmin(dim=1, backend="CPU").long().view(-1)  # Points -> Nearest cluster
 
         # M step: update the centroids to the normalized cluster average: ------
         # Compute the sum of points per cluster:
@@ -77,22 +79,26 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
         # output2, feat2 = model(x2)
         with torch.no_grad():
             logits_x_ulb_w, feat2 = model(ux2)
+        # logits_x_ulb_w, feat2 = model(ux2)
 
         labeled_len = len(target)
         # Compute context vectors for unlabeled data
 
-        y_c_u = compute_context_vector(feat[labeled_len:, ], logits_x_ulb_w, 5, 0.9)
+        y_c_u = compute_context_vector(logits_x_ulb_w, F.softmax(logits_x_ulb_w, dim=1), 5,
+                                       0.9)
         logits_x_lb = output[:labeled_len, :]
-        y_c_l = compute_context_vector(feat[:labeled_len, :], logits_x_lb, 5, 0.9)
+        # y_c_l = compute_context_vector(logits_x_lb, F.softmax(logits_x_lb, dim=1), 5, 0.9)
+        #
+        # t, vlb_weights = timestep_sampler.sample(labeled_len, args.gpu)
+        # t = t.cuda(args.gpu)
+        t2, vlb_weights = timestep_sampler.sample(len(logits_x_ulb_w), args.gpu)
+        t2 = t2.cuda(args.gpu)
 
-        t, vlb_weights = timestep_sampler.sample(labeled_len, args.gpu)
-        t = t.cuda(args.gpu)
+        diffusion_loss, denoised_labeld = diffusion.training_losses(diffusion_model,
+                                                                    logits_x_ulb_w, y_c_u.detach(), t2)
 
-        # diffusion_loss, denoised_labeld = diffusion.training_losses(diffusion_model,
-        #                                                             logits_x_ulb_w, y_c_u, t)
-
-        diffusion_loss_, denoised_labeld_ = diffusion.training_losses(diffusion_model,
-                                                                      logits_x_lb, y_c_l, t)
+        # diffusion_loss_, denoised_labeld_ = diffusion.training_losses(diffusion_model,
+        #                                                               logits_x_lb, y_c_l.detach(), t)
         # p_sample = diffusion.p_sample(diffusion_model, logits_x_ulb_w, y_c_u,
         #                               torch.ones(logits_x_ulb_w.shape[0], dtype=torch.long).cuda(args.gpu) * 5)
         # p_sample_l = diffusion.p_sample(diffusion_model, logits_x_lb, y_c_l,
@@ -105,14 +111,20 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
         # cl, c = KMeans(feat2.detach().cpu(), K=args.no_class, Niter=10, verbose=True)
         # unsup_loss=F.cross_entropy(output[labeled_len:,: ], cl.cuda(args.gpu))
 
-        unsup_loss = compute_unsup_loss(F.softmax(logits_x_ulb_w,dim=1),output[labeled_len:,: ] , args.gpu, num_classes=args.no_class,
+        unsup_loss = compute_unsup_loss(F.softmax(denoised_labeld[:, 0, :], dim=1).detach(), output[labeled_len:, :],
+                                        args.gpu,
+                                        num_classes=args.no_class,
                                         unseen_classes=[])
-        ce_loss = F.cross_entropy(output[:labeled_len,: ], target)
-        prob = F.softmax(output, dim=1)
+        ce_loss = F.cross_entropy(logits_x_lb, target)
+        denoised_output = torch.cat((denoised_labeld[:, 0, :], logits_x_lb), dim=0)
+        prob = F.softmax(denoised_output, dim=1)
         entropy_loss = entropy(torch.mean(prob, 0))
+        # if epoch < 10:
+        #     loss = ce_loss + diffusion_loss_.mean()
+        # else:
 
-        # bce_loss = calculate_bce_loss(args, output2, labeled_len, prob, feat, target)
-        loss = - entropy_loss + ce_loss + diffusion_loss_.mean()
+            # bce_loss = calculate_bce_loss(args, output2, labeled_len, prob, feat, target)
+        loss = -entropy_loss + ce_loss + 0.1 * unsup_loss + 0.1 * diffusion_loss.mean()
 
         # bce_losses.update(bce_loss.item(), args.batch_size)
         ce_losses.update(ce_loss.item(), args.batch_size)
@@ -165,7 +177,7 @@ best_seen_acc = 0
 best_unseen_acc = 0
 
 
-def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, diffusion, diffusion_model):
+def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, diffusion, diffusion_model, timestep_sampler):
     global best_acc, best_seen_acc, best_unseen_acc
     model.eval()
     diffusion_model.eval()
@@ -176,12 +188,14 @@ def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, diffus
         for batch_idx, (x, label) in enumerate(test_loader):
             x, label = x.cuda(args.gpu), label.cuda(args.gpu)
             output, _ = model(x)
-            t = torch.ones(output.shape[0], dtype=torch.long).cuda(args.gpu) * 5
+            y_c_u = sampling.generalized_steps(diffusion_model, F.softmax(output, dim=1),
+                                               100, device=device)
+            t, vlb_weights = timestep_sampler.sample(output.shape[0], args.gpu)
             t = t.cuda(args.gpu)
-            denoised_labeld = diffusion.p_sample(diffusion_model,
-                                                 output, F.softmax(output, dim=1), t)
+            diffusion_loss, denoised_labeld = diffusion.training_losses(diffusion_model,
+                                                                        output, F.softmax(y_c_u, dim=1), t)
 
-            output = denoised_labeld["pred_xstart"]
+            output = denoised_labeld[:, 0, :]
             prob = F.softmax(output, dim=1)
             conf, pred = prob.max(1)
             targets = np.append(targets, label.cpu().numpy())
@@ -224,27 +238,29 @@ def compute_unsup_loss(denoised_soft_labels, logits_x_ulb_s, gpu, num_classes=10
     # Select samples where the confidence is above the threshold
     confident_samples = max_probs > 0.0
     confident_labels = pseudo_labels[confident_samples]
+    confidant_logits = logits_x_ulb_s[confident_samples]
 
     # Balance the set
     unique_labels, counts = confident_labels.unique(return_counts=True)
     # if len(unique_labels) < num_classes:
     #     return torch.tensor(0.0).cuda(gpu)
 
-    min_samples = counts.min()
-
-    balanced_indices = torch.cat(
-        [confident_samples.nonzero()[confident_labels == label][:min_samples] for label in unique_labels])
-
-    # Compute loss only on the balanced subset
-    balanced_logits = logits_x_ulb_s[balanced_indices.squeeze(1)]
-    balanced_labels = pseudo_labels[balanced_indices.squeeze(1)]
+    # min_samples = counts.min()
+    #
+    # balanced_indices = torch.cat(
+    #     [confident_samples.nonzero()[confident_labels == label][:min_samples] for label in unique_labels])
+    #
+    # # Compute loss only on the balanced subset
+    # balanced_logits = logits_x_ulb_s[balanced_indices.squeeze(1)]
+    # balanced_labels = pseudo_labels[balanced_indices.squeeze(1)]
     # balanced_labels = torch.where(balanced_labels < 5, balanced_labels + 5, balanced_labels)
 
     # Assuming a standard cross-entropy loss for simplicity
-    loss = F.cross_entropy(balanced_logits, balanced_labels)
+    loss = F.cross_entropy(confidant_logits, confident_labels)
     return loss
 
 
+@torch.no_grad()
 def compute_context_vector(x_u, pseudo_labels, k, tau):
     # Assuming x is of shape (batch_size, num_features)
     # and pseudo_labels is of shape (batch_size, num_classes)
@@ -294,7 +310,7 @@ def main():
                         help='mini-batch size')
     args = parser.parse_args()
     args.cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if args.cuda else "cpu")
+    device = torch.device(f"cuda:{args.gpu}" if args.cuda else "cpu")
 
     args.savedir = os.path.join(args.exp_root, args.name)
     if not os.path.exists(args.savedir):
@@ -319,7 +335,7 @@ def main():
                                                      transform=TransformTwice(datasets.dict_transform['cifar_train']))
         train_unlabel_set = datasets.OPENWORLDCIFAR100(root='./datasets', labeled=False, labeled_num=args.labeled_num,
                                                        labeled_ratio=args.labeled_ratio, download=True,
-                                                       transform=TransformTwice(datasets.dict_transform['cifar_train']),
+                                                       transform=TransformTwice(datasets.dict_transform['cifar_test']),
                                                        unlabeled_idxs=train_label_set.unlabeled_idxs)
         test_set = datasets.OPENWORLDCIFAR100(root='./datasets', labeled=False, labeled_num=args.labeled_num,
                                               labeled_ratio=args.labeled_ratio, download=True,
@@ -358,7 +374,7 @@ def main():
         if 'linear' not in name and 'layer4' not in name:
             param.requires_grad = False
     diffusion_model = Gpt(prototype_sizes=args.no_class,
-                          predict_xstart=False,
+                          predict_xstart=True,
                           max_freq_log2=14,
                           num_frequencies=128,
                           n_embd=args.no_class,
@@ -369,7 +385,7 @@ def main():
                           attn_pdrop=0.0,
                           resid_pdrop=0.0,
                           embd_pdrop=0.0).cuda(args.gpu)
-    diffusion = create_diffusion(learn_sigma=False, predict_xstart=False,
+    diffusion = create_diffusion(learn_sigma=False, predict_xstart=True,
                                  noise_schedule='linear', steps=100)
     timestep_sampler = UniformSampler(diffusion)
 
@@ -377,18 +393,18 @@ def main():
     ema_helper.register(diffusion_model)
     optimizer_diffusion, lr_scheduler_diffusion = utils_u.make_optimizer(
         diffusion_model.parameters(),
-        'sgd', lr=1.e-3, weight_decay=5.e-4, milestones=[30, 50, 80])
+        'adam', lr=1.e-3, weight_decay=5.e-4, milestones=[50, 100, 150])
     model = model.cuda(args.gpu)
     diffusion_model.cuda(args.gpu)
     # Set the optimizer
-    optimizer = optim.SGD(model.parameters(), lr=1e-1, weight_decay=5e-4, momentum=0.9)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-4)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.milestones, gamma=0.1)
 
     tf_writer = SummaryWriter(log_dir=args.savedir)
 
     for epoch in tqdm(range(args.epochs)):
         mean_uncert = test(args, model, args.labeled_num, device, test_loader, epoch, tf_writer, diffusion,
-                           diffusion_model)
+                           diffusion_model, timestep_sampler)
         train(args, model, device, train_label_loader, train_unlabel_loader, optimizer, epoch, tf_writer, diffusion,
               diffusion_model, optimizer_diffusion, timestep_sampler)
         scheduler.step()

@@ -111,7 +111,17 @@ class OPENWORLDCIFAR10(torchvision.datasets.CIFAR10):
 # Dictionary of transforms
 dict_transform = {
     'cifar_train': transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
+        transforms.RandomCrop(size=32,
+                              padding=int(32*0.125),
+                              padding_mode='reflect'),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    ]),
+    'cifar_train_s': transforms.Compose([
+        transforms.RandomCrop(size=32,
+                              padding=int(32*0.125),
+                              padding_mode='reflect'),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),

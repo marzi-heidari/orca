@@ -7,12 +7,16 @@ import os.path
 import torch.nn.functional as F
 
 class TransformTwice:
-    def __init__(self, transform):
+    def __init__(self, transform,transform2=None):
         self.transform = transform
+        self.transform2 = transform2
 
     def __call__(self, inp):
         out1 = self.transform(inp)
-        out2 = self.transform(inp)
+        if self.transform2 is not None:
+            out2 = self.transform2(inp)
+        else:
+            out2 = self.transform(inp)
         return out1, out2
 
 class AverageMeter(object):

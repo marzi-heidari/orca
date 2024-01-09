@@ -23,7 +23,7 @@ from torch.utils.tensorboard import SummaryWriter
 from itertools import cycle
 
 
-def update_prototype(old_proto, prototypes, alpha=0.9):
+def update_prototype(old_proto, prototypes, alpha=0.1):
     for i in range(old_proto.shape[0]):
         if old_proto[i].sum() == 0:
             old_proto[i] = prototypes[i]
@@ -32,7 +32,7 @@ def update_prototype(old_proto, prototypes, alpha=0.9):
     return prototypes
 
 
-def calculate_dis_loss(discriminator, diffusion_model, prototypes, feat, pseudo_labels, diffusion, gpu):
+def calculate_dis_loss(discriminator, diffusion_model, prototypes, feat, diffusion, gpu):
     criterion = nn.BCEWithLogitsLoss()
 
     # Forward pass for real data
@@ -99,18 +99,30 @@ def kmeans(X, num_clusters, num_iterations=10):
     return centroids, labels
 
 
+def cosine_similarity(x, y):
+    # x: N x D
+    # y: M x D
+    assert x.size(1) == y.size(1)
+
+    # Normalize x and y along the dimension D
+    x_norm = torch.nn.functional.normalize(x, p=2, dim=1)
+    y_norm = torch.nn.functional.normalize(y, p=2, dim=1)
+
+    # Perform matrix multiplication to get cosine similarities
+    return -torch.mm(x_norm, y_norm.t())
+
+
 def euclidean_dist(x, y):
     # x: N x D
     # y: M x D
-    n = x.size(0)
-    m = y.size(0)
-    d = x.size(1)
-    assert d == y.size(1)
+    assert x.size(1) == y.size(1)
 
-    x = x.unsqueeze(1).expand(n, m, d)
-    y = y.unsqueeze(0).expand(n, m, d)
+    # Normalize x and y along the dimension D
+    x_norm = torch.nn.functional.normalize(x, p=2, dim=1)
+    y_norm = torch.nn.functional.normalize(y, p=2, dim=1)
 
-    return torch.pow(x - y, 2).sum(2)
+    # Perform matrix multiplication to get cosine similarities
+    return -torch.mm(x_norm, y_norm.t())
 
 
 def train(args, model, device, train_label_loader, train_unlabel_loader, optimizer, epoch, tf_writer, diffusion,
@@ -136,58 +148,67 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
         diffusion_optimizer.zero_grad()
         optimizer_d.zero_grad()
         output, feat = model(x)
+
         output2, feat_ = model(x2)
 
-        logits_x_ulb_w, feat2 = model(ux2)
+        # logits_x_ulb_w, feat2 = model(ux2)
 
         labeled_len = len(target)
         # Compute context vectors for unlabeled data
 
-        pseudo_labels = F.softmax(logits_x_ulb_w, dim=1).detach()
         one_hot_labels = F.one_hot(target, args.no_class)
         p1 = compute_prototype(feat[:labeled_len, ], one_hot_labels, args.no_class // 2, gpu=args.gpu)
-        logits_x_lb = output[:labeled_len, :]
+        pseudo_labels = F.softmax(output2[labeled_len:], dim=1).detach()
         if epoch == 0:
             p2 = kmeans(feat[labeled_len:, :], args.no_class, )[0]
         else:
-            p2 = compute_prototype(feat[labeled_len:, :], pseudo_labels, args.no_class, gpu=args.gpu)
+            # pseudo_labels = calc_pseudo_lables(feat, labeled_len, prototypes)
+            p2 = compute_prototype(feat[labeled_len:, :], pseudo_labels, args.no_class, gpu=args.gpu, is_unseen=True, )
         proto = torch.cat((p1, p2[args.no_class // 2:, :].cuda(args.gpu)), dim=0)
         prototypes = update_prototype(prototypes, proto)
-        t, vlb_weights = timestep_sampler.sample(labeled_len, args.gpu)
+
+        t, vlb_weights = timestep_sampler.sample(args.batch_size, args.gpu)
         t = t.cuda(args.gpu)
-        labeled_context = torch.zeros((labeled_len, 512)).cuda(args.gpu)
+        context_vector = torch.zeros((args.batch_size, 512)).cuda(args.gpu)
         for i in range(labeled_len):
-            labeled_context[i] = prototypes[target[i]]
+            context_vector[i] = prototypes[target[i]]
+        for i in range(labeled_len, args.batch_size):
+            context_vector[i] = prototypes[torch.argmax(pseudo_labels[i - labeled_len])]
 
         diffusion_loss_, denoised_labeld_ = diffusion.training_losses(diffusion_model,
-                                                                      feat[:labeled_len, :].detach(),
-                                                                      labeled_context.detach(), t)
+                                                                      feat,
+                                                                      context_vector.detach(), t)
 
-        # discriminator_loss = calculate_dis_loss(discriminator, diffusion_model, prototypes[50:], feat[labeled_len:],
-        #                                         pseudo_labels,
-        #                                         diffusion, args.gpu)
+        discriminator_loss = calculate_dis_loss(discriminator, diffusion_model, context_vector.detach(), feat,
 
-        # discriminator_loss1 = calculate_gen_loss(discriminator, diffusion_model, prototypes[50:],
-        #
-        #                                          diffusion, args.gpu)
+                                                diffusion, args.gpu)
 
-        logits_ub_s = output[labeled_len:, :]
+        generator_loss = calculate_gen_loss(discriminator, diffusion_model, context_vector.detach(),
+
+                                                 diffusion, args.gpu)
+
+        # logits_ub_s = output[labeled_len:, :]
         # unsup_loss = compute_unsup_loss(pseudo_labels, logits_ub_s, args.gpu, num_classes=args.no_class)
-        bce_loss = calculate_bce_loss(args, output2, labeled_len, F.softmax(output, dim=1), feat, target)
-        query_to_proto_distance = euclidean_dist(feat[:labeled_len], prototypes[:50])
-        # ce_loss = F.cross_entropy(logits_x_lb, target)
-        ce_loss = F.cross_entropy(-query_to_proto_distance, target)
-        distances = euclidean_dist(feat[labeled_len:], prototypes)
-        distances2 = euclidean_dist(feat2, prototypes)
-        unsup_loss = F.mse_loss(F.softmax(-distances, dim=1), F.softmax(-distances2, dim=1))
-        prob = F.softmax(distances, dim=1)
-        entropy_loss = entropy(torch.mean(prob, 0))
+        # bce_loss = calculate_bce_loss(args, output2, labeled_len, F.softmax(output, dim=1), feat, target)
+        # query_to_proto_distance = euclidean_dist(feat[:labeled_len], prototypes[:args.no_class // 2])
 
-        loss =  ce_loss + diffusion_loss_.mean() + 0.5 * unsup_loss+bce_loss
+        ce_loss = F.cross_entropy(output[:labeled_len], target)
+        # distances = euclidean_dist(feat[labeled_len:], prototypes)
+        # distances2 = euclidean_dist(feat_[labeled_len:], prototypes)
+        unsup_loss = compute_unsup_loss(pseudo_labels, output[labeled_len:], args.gpu, num_classes=args.no_class)
+        #
+        # prob = F.softmax(-distances, dim=1)
+        # # print(prob[0])
+        # # exit()
+        # entropy_loss = entropy(torch.mean(prob, 0))
+        if epoch < 5:
+            loss = ce_loss
+        else:
+            loss = ce_loss  + 0.5 * unsup_loss + generator_loss + discriminator_loss + diffusion_loss_.mean()
 
         # bce_losses.update(bce_loss.item(), args.batch_size)
         ce_losses.update(ce_loss.item(), args.batch_size)
-        entropy_losses.update(entropy_loss.item(), args.batch_size)
+        entropy_losses.update(ce_loss.item(), args.batch_size)
         optimizer.zero_grad()
 
         diffusion_optimizer.zero_grad()
@@ -203,6 +224,19 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
     tf_writer.add_scalar('loss/ce', ce_losses.avg, epoch)
     tf_writer.add_scalar('loss/entropy', entropy_losses.avg, epoch)
     return prototypes
+
+
+def calc_pseudo_lables(feat, labeled_len, prototypes):
+    distances2 = euclidean_dist(feat[labeled_len:], prototypes)
+    pseudo_labels = F.softmax(-distances2, dim=1)
+    return pseudo_labels
+
+
+def get_prototype_pseudo_loss(distances, distances2):
+    pseudo_ = F.softmax(-distances2, dim=1)
+    mask = torch.argmax(pseudo_, dim=1) > 0.0
+    unsup_loss = F.cross_entropy(F.softmax(-distances, dim=1), torch.argmax(-distances2, dim=1), reduction='mean')
+    return unsup_loss
 
 
 def calculate_bce_loss(args, output2, labeled_len, prob, feat, target):
@@ -240,10 +274,11 @@ def calculate_bce_loss(args, output2, labeled_len, prob, feat, target):
 best_acc = 0
 best_seen_acc = 0
 best_unseen_acc = 0
+best_epoch = 0
 
 
 def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, diffusion, diffusion_model, prototypes):
-    global best_acc, best_seen_acc, best_unseen_acc
+    global best_acc, best_seen_acc, best_unseen_acc, best_epoch
     model.eval()
     diffusion_model.eval()
     preds = np.array([])
@@ -259,8 +294,8 @@ def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, diffus
             #                                      output, F.softmax(output, dim=1), t)
             #
             # output = denoised_labeld["pred_xstart"]
-            query_to_proto_distance = euclidean_dist(feat, prototypes)
-            prob = -query_to_proto_distance
+            # query_to_proto_distance = euclidean_dist(feat, prototypes)
+            prob = F.softmax(output, dim=1)
             conf, pred = prob.max(1)
             targets = np.append(targets, label.cpu().numpy())
             preds = np.append(preds, pred.cpu().numpy())
@@ -270,7 +305,7 @@ def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, diffus
 
     seen_mask = targets < labeled_num
     unseen_mask = ~seen_mask
-    overall_acc = cluster_acc(preds, targets)
+    overall_acc = accuracy(preds, targets)
     seen_acc = accuracy(preds[seen_mask], targets[seen_mask])
     unseen_acc = cluster_acc(preds[unseen_mask], targets[unseen_mask])
     unseen_nmi = metrics.normalized_mutual_info_score(targets[unseen_mask], preds[unseen_mask])
@@ -279,10 +314,12 @@ def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, diffus
         best_acc = overall_acc
         best_unseen_acc = unseen_acc
         best_seen_acc = seen_acc
+        best_epoch = epoch
     print('Test overall acc {:.4f}, seen acc {:.4f}, unseen acc {:.4f}'.format(overall_acc, seen_acc, unseen_acc))
     print('Test unseen nmi {:.4f}, mean uncertainty {:.4f}'.format(unseen_nmi, mean_uncert))
-    print('Best overall acc {:.4f}, seen acc {:.4f}, unseen acc {:.4f}\n'.format(best_acc, best_seen_acc,
-                                                                                 best_unseen_acc))
+    print('Best overall acc {:.4f}, seen acc {:.4f}, unseen acc {:.4f}, best epoch {}\n'.format(best_acc, best_seen_acc,
+                                                                                                best_unseen_acc,
+                                                                                                best_epoch))
     tf_writer.add_scalar('acc/overall', overall_acc, epoch)
     tf_writer.add_scalar('acc/seen', seen_acc, epoch)
     tf_writer.add_scalar('acc/unseen', unseen_acc, epoch)
@@ -297,7 +334,7 @@ def compute_unsup_loss(denoised_soft_labels, logits_x_ulb_s, gpu, num_classes=10
     max_probs, _ = torch.max(denoised_soft_labels, dim=1)
 
     # Select samples where the confidence is above the threshold
-    confident_samples = (max_probs > 0.5) & (pseudo_labels > 49)
+    confident_samples = (max_probs > 0.)
     # confident_samples =
     confident_labels = pseudo_labels[confident_samples]
 
@@ -321,7 +358,6 @@ def compute_unsup_loss(denoised_soft_labels, logits_x_ulb_s, gpu, num_classes=10
     return loss
 
 
-@torch.no_grad()
 def compute_prototype(feat, targets, num_classes, is_unseen=False, tau=0.0, gpu=0):
     """
     Compute prototypes for given data.
@@ -436,7 +472,7 @@ def main():
         state_dict = torch.load('./pretrained/simclr_cifar_100.pth.tar')
     model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
-    discriminator = SimpleDiscriminator()
+    discriminator = SimpleDiscriminator(512)
     discriminator = discriminator.cuda(args.gpu)
     # Freeze the earlier filters
     for name, param in model.named_parameters():
@@ -448,14 +484,14 @@ def main():
                           num_frequencies=128,
                           n_embd=512,
                           encoder_depth=1,
-                          n_layer=12,
-                          n_head=16,
+                          n_layer=1,
+                          n_head=1,
                           len_input=3,
-                          attn_pdrop=0.1,
-                          resid_pdrop=0.1,
-                          embd_pdrop=0.1).cuda(args.gpu)
+                          attn_pdrop=0.0,
+                          resid_pdrop=0.0,
+                          embd_pdrop=0.0).cuda(args.gpu)
     diffusion = create_diffusion(learn_sigma=False, predict_xstart=False,
-                                 noise_schedule='linear', steps=100)
+                                 noise_schedule='linear', steps=50)
     timestep_sampler = UniformSampler(diffusion)
 
     ema_helper = ema.EMAHelper(mu=0.9999)

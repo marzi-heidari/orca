@@ -1,11 +1,9 @@
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-from scipy.optimize import linear_sum_assignment
-import os
-import os.path
 import torch.nn.functional as F
-from torch.utils.data import BatchSampler, DataLoader, Sampler
+from scipy.optimize import linear_sum_assignment
+from torch.utils.data import Sampler
 
 
 class TransformTwice:
@@ -17,8 +15,9 @@ class TransformTwice:
         out2 = self.transform(inp)
         return out1, out2
 
+
 class AverageMeter(object):
-    
+
     def __init__(self, name, fmt=':f'):
         self.name = name
         self.fmt = fmt
@@ -40,12 +39,13 @@ class AverageMeter(object):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
         return fmtstr.format(**self.__dict__)
 
+
 def accuracy(output, target):
-    
     num_correct = np.sum(output == target)
     res = num_correct / len(target)
 
     return res
+
 
 def cluster_acc(y_pred, y_true):
     """
@@ -66,6 +66,7 @@ def cluster_acc(y_pred, y_true):
 
     return w[row_ind, col_ind].sum() / y_pred.size
 
+
 def entropy(x):
     """ 
     Helper function to compute the entropy over the batch 
@@ -73,18 +74,19 @@ def entropy(x):
     output: entropy value [is ideally -log(num_classes)]
     """
     EPS = 1e-8
-    x_ =  torch.clamp(x, min = EPS)
-    b =  x_ * torch.log(x_)
+    x_ = torch.clamp(x, min=EPS)
+    b = x_ * torch.log(x_)
 
-    if len(b.size()) == 2: # Sample-wise entropy
-        return - b.sum(dim = 1).mean()
-    elif len(b.size()) == 1: # Distribution-wise entropy
+    if len(b.size()) == 2:  # Sample-wise entropy
+        return - b.sum(dim=1).mean()
+    elif len(b.size()) == 1:  # Distribution-wise entropy
         return - b.sum()
     else:
-        raise ValueError('Input tensor is %d-Dimensional' %(len(b.size())))
+        raise ValueError('Input tensor is %d-Dimensional' % (len(b.size())))
+
 
 class MarginLoss(nn.Module):
-    
+
     def __init__(self, m=0.2, weight=None, s=10):
         super(MarginLoss, self).__init__()
         self.m = m
@@ -95,7 +97,7 @@ class MarginLoss(nn.Module):
         index = torch.zeros_like(x, dtype=torch.uint8)
         index.scatter_(1, target.data.view(-1, 1), 1)
         x_m = x - self.m * self.s
-    
+
         output = torch.where(index, x_m, x)
         return F.cross_entropy(output, target, weight=self.weight)
 
@@ -119,7 +121,10 @@ class BalancedBatchSampler(Sampler):
         for _ in range(len(self.class_indices[0]) // (self.batch_size // self.num_classes)):
             batch = []
             for class_idx_list in self.class_indices:
-                batch.extend(np.random.choice(class_idx_list, self.batch_size // self.num_classes, replace=False))
+                if len(class_idx_list) == 0:
+                    continue
+                random_sample = np.random.choice(class_idx_list, self.batch_size // self.num_classes, replace=False)
+                batch.extend(random_sample)
             np.random.shuffle(batch)
             batches.extend(batch)
         return batches

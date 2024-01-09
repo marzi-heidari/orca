@@ -141,13 +141,13 @@ class NormedLinear(nn.Module):
 
 
 class SimpleDiscriminator(nn.Module):
-    def __init__(self):
+    def __init__(self,input_size):
         super(SimpleDiscriminator, self).__init__()
 
         # Define the architecture
         self.net = nn.Sequential(
             # First linear layer
-            nn.Linear(512, 256),
+            nn.Linear(input_size, 256),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.3),
 
